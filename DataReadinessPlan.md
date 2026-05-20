@@ -25,6 +25,13 @@ Sources used:
 - `emp_length` normalized cleanly to integer years `0` through `10`, with one malformed raw value:
   - unexpected raw value: `reactors"` with count `1`
   - handling: convert to `NULL` rather than force an invalid numeric value
+- the Step 2 date audit found a small number of malformed raw values in fields that should follow `MMM-YYYY`:
+  - `issue_d`: `1` invalid value, top bad value `Source Verified`
+  - `earliest_cr_line`: `255` invalid values, including `0`, state codes such as `CA`, and text such as `debt_consolidation`
+  - `last_pymnt_d`: `247` invalid values, many resembling numeric amounts such as `0.0`
+  - `next_pymnt_d`: `209` invalid values, many resembling numeric amounts such as `0.0`
+  - `last_credit_pull_d`: `156` invalid values, many resembling numeric amounts such as `0.0`
+- this pattern suggests a small number of malformed or shifted rows in the raw CSV rather than a systematic date-format problem
 
 ## High Missingness Snapshot
 
@@ -176,6 +183,35 @@ Validation notes:
 - The expected categories mapped correctly to integer values from `0` to `10`.
 - One malformed raw value was found: `reactors"`.
 - Because it does not match the documented category set, it should be treated as a data-quality anomaly and mapped to `NULL`.
+
+### Step 2 date fields
+
+Audited columns:
+- `issue_d`
+- `earliest_cr_line`
+- `last_pymnt_d`
+- `next_pymnt_d`
+- `last_credit_pull_d`
+
+Expected format:
+- `MMM-YYYY`
+
+Observed result:
+- The overwhelming majority of values match the expected pattern.
+- A small number of rows contain values that are clearly not dates, including:
+  - category-like values such as `Source Verified`, `debt_consolidation`
+  - state abbreviations such as `CA`, `IL`
+  - ZIP-like values such as `080xx`, `223xx`
+  - numeric-looking values such as `0.0`, `9000.00`, `19184.07`
+
+Interpretation:
+- This is most likely caused by a small number of malformed or shifted raw CSV rows.
+- It does not appear to be a broad failure of the date format itself.
+
+Handling decision:
+1. Parse valid `MMM-YYYY` values to proper dates using the first day of the month.
+2. Convert invalid raw date values to `NULL`.
+3. Create invalid-value flags for each audited date column so the anomalies remain traceable.
 
 ## Concrete Data Preparation Steps
 
