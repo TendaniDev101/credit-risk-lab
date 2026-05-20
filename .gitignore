@@ -1,0 +1,11 @@
+.DS_Store
+.venv/
+.ipynb_checkpoints/
+__pycache__/
+
+data/loan.csv
+data/*.parquet
+data/*.crc
+
+spark-warehouse/
+metastore_db/
