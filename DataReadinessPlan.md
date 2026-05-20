@@ -32,6 +32,10 @@ Sources used:
   - `next_pymnt_d`: `209` invalid values, many resembling numeric amounts such as `0.0`
   - `last_credit_pull_d`: `156` invalid values, many resembling numeric amounts such as `0.0`
 - this pattern suggests a small number of malformed or shifted rows in the raw CSV rather than a systematic date-format problem
+- Step 3 column review outcome:
+  - dropped immediately: `id`, `member_id`, `url`
+  - dropped after review: `desc`
+  - retained for further cleaning: `title`
 
 ## High Missingness Snapshot
 
@@ -82,7 +86,7 @@ So for each field, null handling must be decided from business meaning, not just
 | `pymnt_plan` | Indicates whether a payment plan has been put in place for the loan. | Keep initially, but it is nearly constant. Consider binary encoding or dropping if low signal. |
 | `url` | URL for the Lending Club listing page. | Drop. It is null for all rows in this extract. |
 | `desc` | Borrower-provided loan description. | Treat as optional free text. Because it is very sparse, either drop for baseline modeling or reserve for a later NLP pass. |
-| `title` | Borrower-provided loan title. | Likely overlaps heavily with `purpose`. Keep for comparison first, then probably drop if redundant/high-cardinality. |
+| `title` | Borrower-provided loan title. | Keep for now. It likely overlaps with `purpose`, but it needs normalization first because case and phrasing variants are currently treated as different values. |
 | `zip_code` | First 3 numbers of the borrower ZIP code, masked as `109xx`, `713xx`, etc. | Strip `xx`. Store as 3-digit ZIP prefix string, not integer, to preserve leading zeroes. |
 | `dti` | Debt-to-income ratio. Dictionary defines it as monthly debt obligations divided by self-reported monthly income, excluding mortgage and the requested LC loan. | Keep as numeric. Check outliers, negatives, and missing values. |
 | `delinq_2yrs` | Number of 30+ day delinquencies in the borrower credit file during the last 2 years. | Keep as count variable. |
@@ -174,8 +178,18 @@ Interpretation:
 - Short borrower-entered text label such as `Debt consolidation`.
 
 Modeling implication:
-- Likely overlaps with `purpose`.
-- We should compare `title` against `purpose` before deciding whether to drop it.
+- `title` has very high cardinality, with an approximate distinct count of `61,876`.
+- The head of the distribution shows many useful repeated labels, but also obvious casing and phrasing duplication.
+- Examples that should likely collapse into the same normalized value:
+  - `Debt consolidation`
+  - `Debt Consolidation`
+  - `debt consolidation`
+- It likely overlaps with `purpose`, but we should normalize it before deciding whether it adds signal beyond `purpose`.
+
+Current decision:
+- Keep `title` for now.
+- Drop `desc`.
+- Revisit `title` after text normalization.
 
 ### `emp_length`
 
@@ -242,9 +256,17 @@ Drop immediately:
 - `member_id`
 - `url`
 
-Candidate drop after review:
+Dropped after review:
 - `desc`
+
+Retained after review:
 - `title`
+
+Planned `title` cleanup:
+1. trim whitespace
+2. convert to lowercase
+3. collapse obvious case-only duplicates
+4. compare against `purpose` to judge incremental value
 
 ### Step 4: Preserve missingness information
 
