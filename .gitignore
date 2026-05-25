@@ -6,6 +6,7 @@ __pycache__/
 data/loan.csv
 data/*.parquet
 data/*.crc
+data/
 
 spark-warehouse/
 metastore_db/
