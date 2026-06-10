@@ -6,12 +6,12 @@ Loan default risk modeling and decision support
 ## Description
 This project uses large-scale historical loan data to analyze borrower behavior, identify patterns associated with repayment risk, and build a machine learning model that predicts the probability of loan default.
 
-The workflow starts with data exploration and cleaning on a large Lending Club style dataset using scalable tools such as PySpark. From there, the project will move into feature engineering, model development, evaluation, and calibration so that predicted probabilities are useful in a real credit decision setting.
+The workflow starts with data exploration and cleaning on a large Lending Club style dataset using scalable tools such as PySpark. From there, the project moves through feature engineering, model development, temporal evaluation, and threshold analysis so that predicted probabilities can support real credit decisions.
 
-If model performance is strong enough, the final stage of the project will be deployment into an application environment where new loan applications can be scored in real time. That scoring layer is intended to support three business decisions:
+The intended scoring layer supports three business decisions:
 
 1. Estimating the probability that an applicant will default.
-2. Recommending whether the loan should be approved or declined.
+2. Recommending whether the loan should be approved, reviewed, or declined.
 3. Suggesting a risk-adjusted interest rate for approved applicants.
 
 ## Core Objectives
@@ -35,31 +35,33 @@ Accurate default prediction helps reduce credit losses, improve pricing decision
 # Credit Risk Modeling Report
 
 ## Executive Summary
-This project built a credit-risk modeling workflow for predicting whether a resolved loan will default. The work started with scalable data preparation in PySpark, moved through statistical feature analysis, and then compared multiple model architectures on the same default-prediction task.
+This project now has a complete temporal credit-risk evaluation workflow. The workflow prepares more than two million historical loan records, defines a clean resolved-loan default target, selects features using training-period data only, compares multiple model families on a later validation period, tunes the leading gradient-boosted tree, and evaluates the selected model once on the newest untouched test period.
 
-The target variable was `default_flag`, where resolved loans were labeled as:
+The authoritative result is:
 
-| Target value | Loan statuses |
+```text
+tuned_gbt_full_temporal
+```
+
+| Evaluation | Rows | Default rate | ROC AUC | PR AUC | Brier score | Top-decile default rate | Top-decile lift |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Final untouched temporal test | `148,972` | `20.23%` | `0.6843` | `0.3453` | `0.1511` | `41.62%` | `2.0569` |
+
+The model's highest-risk 10% had an actual default rate of `41.62%`, compared with `20.23%` across the complete test period. Therefore, the highest-risk decile was slightly more than twice as risky as the average test loan.
+
+The earlier random-sample tuned GBT achieved ROC AUC `0.7032` and top-decile lift `2.3230`. Those results remain useful as model-development evidence, but the lower temporal test result is the more credible estimate of future-period performance because the model is evaluated on loans originated after the training and validation periods.
+
+## Target Definition And Eligible Population
+The original CSV contains `2,260,668` loans. Cleaning and conversion to Parquet preserve all source rows. Rows are removed from the modeling population only when defining a target that requires a known final repayment outcome.
+
+The binary target is:
+
+| `default_flag` | Loan statuses |
 |---:|---|
 | `0` | `Fully Paid`, `Does not meet the credit policy. Status:Fully Paid` |
 | `1` | `Charged Off`, `Default`, `Does not meet the credit policy. Status:Charged Off` |
 
-Unresolved statuses such as `Current`, `In Grace Period`, and late-stage active loans were excluded because the final repayment outcome was not yet known.
-
-The final modeling dataset contained `1,306,386` resolved loans with a default rate of `20.09%`. Model experiments used a reproducible sample of `350,000` rows, split into `279,890` training rows and `70,110` held-out test rows. The modeling sample default rate was `19.99%`.
-
-The strongest model so far is:
-
-| Champion model | Feature set | ROC AUC | PR AUC | Brier score | Top-decile default rate | Top-decile lift |
-|---|---|---:|---:|---:|---:|---:|
-| Tuned gradient-boosted trees | Top 15 independent features | `0.7032` | `0.3742` | `0.1456` | `46.34%` | `2.3230` |
-
-The tuned gradient-boosted tree is the best performance model. Logistic regression remains the best interpretability benchmark.
-
-## Data Preparation And Target Definition
-The dataset was first standardized and converted to a faster Parquet working snapshot. The workflow cleaned or transformed fields such as `term`, `emp_length`, date columns, and missingness indicators.
-
-Outcome, servicing, and post-origination fields were excluded from the modeling feature set to reduce leakage. Examples include fields related to payments, recoveries, loan balance after origination, final payment dates, and settlement outcomes. Pricing/risk-grade fields such as `grade`, `sub_grade`, `int_rate`, and `installment` were kept out of the main independent model and used only as a benchmark comparison.
+Unresolved statuses such as `Current`, `In Grace Period`, and late loans are excluded. A current loan cannot safely be labeled as non-default because it may still default later.
 
 Resolved target counts:
 
@@ -70,359 +72,253 @@ Resolved target counts:
 | `Charged Off` | `1` | `261,654` |
 | `Default` | `1` | `31` |
 | `Does not meet the credit policy. Status:Charged Off` | `1` | `761` |
+| **Total resolved modeling population** | | **`1,306,386`** |
 
-Candidate modeling features after leakage review:
+The complete resolved population has an overall default rate of approximately `20.09%`.
 
-| Feature type | Count |
-|---|---:|
-| Numeric baseline candidates | `41` |
-| Categorical baseline candidates | `7` |
-| Excluded leakage/pricing/raw columns present | `50` |
+## Data Preparation And Leakage Control
+The PySpark workflow:
 
-## How Feature Usefulness Was Determined
-Feature usefulness was not based only on raw correlation with the target. Correlation is useful, but it mainly captures linear relationships and can miss nonlinear risk patterns, categorical effects, and feature interactions. The feature-selection process used several complementary statistics.
+1. Trims and standardizes raw string values.
+2. Normalizes fields such as `term`, `emp_length`, and ZIP prefixes.
+3. Parses valid month-year fields into dates and flags malformed raw values.
+4. Groups normalized loan-title values into `title_grouped`.
+5. Creates a faster Parquet working snapshot.
+6. Creates meaningful missingness indicators where absence may carry risk information.
+7. Excludes fields that would not be available at application time.
 
-### Numeric Feature Statistics
-For numeric features, the following statistics were calculated:
+The main independent model excludes:
 
-| Statistic | Formula / definition | Why it matters |
+- repayment outcomes and servicing fields;
+- payments, recoveries, outstanding principal, and late fees;
+- hardship and settlement fields;
+- future payment and credit-pull dates;
+- identifiers and unstructured raw text;
+- Lending Club pricing and underwriting outputs such as `grade`, `sub_grade`, `int_rate`, and `installment`.
+
+This prevents the model from appearing strong by learning information that becomes available only after the lending decision or by copying Lending Club's existing underwriting decision.
+
+## Rigorous Temporal Evaluation Design
+The final experiment uses complete issue months and preserves chronological order:
+
+| Split | Rows | Default rate | First issue month | Last issue month | Purpose |
+|---|---:|---:|---|---|---|
+| Training | `1,007,621` | `19.47%` | June 2007 | July 2016 | Feature selection and model fitting |
+| Validation | `149,793` | `24.13%` | August 2016 | April 2017 | Architecture comparison, GBT tuning, threshold selection |
+| Test | `148,972` | `20.23%` | May 2017 | December 2018 | One final untouched evaluation |
+
+The training set was requested to contain at least one million records. Because complete origination months remain together, the training split contains `1,007,621` loans rather than splitting July 2016 between datasets.
+
+The changing default rates across time are important. Validation default rate increased to `24.13%`, while the later test period returned to `20.23%`. This is evidence of population or outcome drift and explains why chronological evaluation is stricter than a random split.
+
+## Training-Only Feature Shortlisting
+Feature selection is performed using a reproducible sample of `200,000` loans from the training period only. Validation and test outcomes do not influence the shortlist.
+
+### Numeric Statistical Utility
+Numeric features are measured using:
+
+| Statistic | Definition | Purpose |
 |---|---|---|
-| Pearson correlation | `corr(x, y) = cov(x, y) / (std(x) * std(y))` | Measures linear association with default. |
-| Standardized mean difference | `(mean_default - mean_non_default) / pooled_std` | Measures how far apart default and non-default borrowers are on the feature scale. |
-| KS statistic | `max_x |F_default(x) - F_non_default(x)|` | Measures the maximum separation between the default and non-default distributions. |
-| Information value | `sum((bad_dist_b - good_dist_b) * WOE_b)` | Measures how much a binned variable separates good and bad loans. |
-| Weight of evidence | `WOE_b = ln(bad_dist_b / good_dist_b)` | Measures the direction and strength of risk in each bin. |
+| Information value | `sum((bad_distribution - good_distribution) * WOE)` | Measures separation across feature ranges |
+| KS statistic | `max abs(F_default(x) - F_non_default(x))` | Measures maximum distribution separation |
+| Standardized mean difference | `(mean_default - mean_non_default) / pooled_std` | Measures group difference on a comparable scale |
+| Absolute Pearson correlation | `abs(corr(feature, default_flag))` | Measures linear association with default |
 
-The numeric utility score combined percentile ranks:
+The measurements use different scales, so each is converted into a percentile rank relative to the other candidate features:
 
 ```text
-numeric_score =
-    0.35 * IV_rank
-  + 0.25 * KS_rank
-  + 0.20 * standardized_effect_rank
-  + 0.20 * abs_correlation_rank
+numeric statistical utility =
+    0.35 * IV percentile rank
+  + 0.25 * KS percentile rank
+  + 0.20 * standardized-effect percentile rank
+  + 0.20 * absolute-correlation percentile rank
 ```
 
-### Categorical Feature Statistics
-For categorical features, categories were profiled by default rate and grouped where needed. The following statistics were used:
+### Categorical Statistical Utility
+Categorical features are measured using:
 
-| Statistic | Formula / definition | Why it matters |
+| Statistic | Definition | Purpose |
 |---|---|---|
-| Information value | Same IV framework after grouping categories | Measures categorical separation of good and bad loans. |
-| Cramer's V | `sqrt((chi_square / n) / min(r - 1, c - 1))` | Measures association strength between category and default. |
-| Default-rate range | `max_category_default_rate - min_category_default_rate` | Shows how much risk differs between categories. |
-| Category lift | `category_default_rate / overall_default_rate` | Shows categories with unusually high or low default risk. |
-
-The categorical utility score combined percentile ranks:
+| Information value | IV calculated across grouped categories | Measures good/bad separation |
+| Cramer's V | Chi-square association strength | Measures overall association with default |
+| Default-rate range | Highest category default rate minus lowest | Measures practical risk differences between categories |
 
 ```text
-categorical_score =
-    0.45 * IV_rank
-  + 0.35 * Cramers_V_rank
-  + 0.20 * default_rate_range_rank
+categorical statistical utility =
+    0.45 * IV percentile rank
+  + 0.35 * Cramer's V percentile rank
+  + 0.20 * default-rate-range percentile rank
 ```
 
-### Diversified Feature Shortlist
-After raw ranking, features were grouped into business families such as debt burden, credit utilization, income verification, housing, loan size, credit recency, and credit inquiries. The shortlist was then diversified so the first model did not over-concentrate on many versions of the same borrower behavior.
+The statistical utility score is a relative ranking score, not a probability or accuracy measure. A utility score of `0.98` means a feature ranked very strongly across the selected statistics compared with other candidates.
 
-This produced a top-15 feature set that balanced statistical strength with business coverage.
+### Diversification Across Risk Families
+Taking the raw top 15 could over-select many closely related features. The workflow assigns features to business families such as debt burden, credit utilization, credit activity, loan size, income, housing, and inquiries. It then prioritizes the strongest feature from each family before selecting additional features from the same family.
 
-## Most Useful Features Found
-The top-15 independent feature set used for the main models was:
+This creates a model that uses multiple risk themes instead of relying heavily on many versions of one borrower behavior.
 
-| Rank | Feature | Type | Business interpretation |
-|---:|---|---|---|
-| 1 | `dti` | Numeric | Debt burden relative to income. |
-| 2 | `acc_open_past_24mths` | Numeric | Recent credit account-opening activity. |
-| 3 | `all_util` | Numeric | Overall credit utilization. |
-| 4 | `mort_acc` | Numeric | Mortgage history and depth of credit profile. |
-| 5 | `tot_cur_bal` | Numeric | Total current balance across accounts. |
-| 6 | `num_rev_tl_bal_gt_0` | Numeric | Active revolving accounts with balances. |
-| 7 | `verification_status` | Categorical | Whether reported income was verified. |
-| 8 | `loan_amnt` | Numeric | Requested loan size. |
-| 9 | `home_ownership` | Categorical | Housing status and stability signal. |
-| 10 | `title_grouped` | Categorical | Grouped loan title or stated borrower intent. |
-| 11 | `mo_sin_rcnt_tl` | Numeric | Months since most recent account opened. |
-| 12 | `annual_inc` | Numeric | Borrower income. |
-| 13 | `inq_last_6mths` | Numeric | Recent credit inquiries. |
-| 14 | `term` | Numeric | Loan duration, usually 36 or 60 months. |
-| 15 | `total_rev_hi_lim` | Numeric | Total revolving credit limit. |
+## Final Training-Only Feature Set
+The temporal model uses these 15 application-time features:
 
-The strongest raw statistical features were:
+| Rank | Feature | Type | Risk family | Statistical utility | Information value |
+|---:|---|---|---|---:|---:|
+| 1 | `acc_open_past_24mths` | Numeric | Credit activity | `0.9841` | `0.0888` |
+| 2 | `dti` | Numeric | Debt burden | `0.9598` | `0.0795` |
+| 3 | `all_util` | Numeric | Credit utilization | `0.9159` | `0.0579` |
+| 4 | `verification_status` | Categorical | Income verification | `0.8857` | `0.0518` |
+| 5 | `title_grouped` | Categorical | Loan purpose | `0.8571` | `0.0319` |
+| 6 | `tot_cur_bal` | Numeric | Total balance | `0.8549` | `0.0418` |
+| 7 | `mort_acc` | Numeric | Mortgage history | `0.8293` | `0.0330` |
+| 8 | `mo_sin_rcnt_tl` | Numeric | Credit recency | `0.8183` | `0.0413` |
+| 9 | `loan_amnt` | Numeric | Loan size | `0.7329` | `0.0323` |
+| 10 | `num_rev_tl_bal_gt_0` | Numeric | Active accounts | `0.7256` | `0.0296` |
+| 11 | `home_ownership` | Categorical | Housing | `0.6857` | `0.0276` |
+| 12 | `annual_inc` | Numeric | Income | `0.6841` | `0.0330` |
+| 13 | `term` | Numeric | Loan structure | `0.6799` | `0.0000` |
+| 14 | `total_rev_hi_lim` | Numeric | Revolving capacity | `0.6390` | `0.0283` |
+| 15 | `inq_fi` | Numeric | Credit inquiries | `0.6037` | `0.0170` |
 
-| Raw rank | Feature | Utility score | IV | KS | Correlation / Cramer's V |
-|---:|---|---:|---:|---:|---:|
-| 1 | `dti` | `0.9793` | `0.0758` | `0.1136` | `0.0995` correlation |
-| 2 | `acc_open_past_24mths` | `0.9646` | `0.0620` | `0.1022` | `0.1005` correlation |
-| 3 | `all_util` | `0.9354` | `0.0564` | `0.1018` | `0.0943` correlation |
-| 4 | `mort_acc` | `0.8976` | `0.0390` | `0.0917` | `-0.0769` correlation |
-| 5 | `tot_cur_bal` | `0.8854` | `0.0419` | `0.0907` | `-0.0728` correlation |
-| 6 | `open_rv_24m` | `0.8659` | `0.0377` | `0.0807` | `0.0812` correlation |
-| 7 | `num_rev_tl_bal_gt_0` | `0.8305` | `0.0340` | `0.0763` | `0.0742` correlation |
-| 8 | `verification_status` | `0.8286` | `0.0601` | N/A | `0.0954` Cramer's V |
-| 9 | `loan_amnt` | `0.8061` | `0.0339` | `0.0819` | `0.0657` correlation |
-| 10 | `home_ownership` | `0.8000` | `0.0338` | N/A | `0.0737` Cramer's V |
+`term` has zero information value in the univariate IV calculation but remains useful through other statistics, diversification, and interactions with other model inputs. This illustrates why feature selection should not rely on one statistic alone.
 
-Important categorical patterns:
+## Validation Architecture Comparison
+Three independent model families were fitted on all `1,007,621` training loans and compared on the later validation period:
 
-| Categorical feature | IV | Cramer's V | Notable risk pattern |
-|---|---:|---:|---|
-| `verification_status` | `0.0601` | `0.0954` | `Verified` loans had a higher sampled default rate (`24.06%`) than `Not Verified` loans (`14.53%`). |
-| `home_ownership` | `0.0338` | `0.0737` | `RENT` had a higher sampled default rate (`23.45%`) than `MORTGAGE` (`17.18%`). |
-| `title_grouped` | `0.0272` | `0.0661` | Business-related and missing titles showed elevated risk. |
-| `purpose` | `0.0213` | `0.0583` | Small-business and renewable-energy purposes showed higher risk than car and wedding purposes. |
-
-Useful interaction patterns were also found. For example, high recent account-opening activity combined with missing or risky title groups showed materially higher default rates. High loan amount combined with business-related purpose/title was also elevated. These interaction patterns help explain why tree-based and boosted-tree models can improve over a purely linear model.
-
-## Feature Importance From The Final Model
-The tuned gradient-boosted tree learned a different but related importance ordering. This ranking is model-based, not purely statistical.
-
-| Rank | Feature | Tuned GBT importance |
-|---:|---|---:|
-| 1 | `total_rev_hi_lim` | `0.1472` |
-| 2 | `loan_amnt` | `0.1349` |
-| 3 | `num_rev_tl_bal_gt_0` | `0.0887` |
-| 4 | `dti` | `0.0805` |
-| 5 | `annual_inc` | `0.0695` |
-| 6 | `acc_open_past_24mths` | `0.0639` |
-| 7 | `inq_last_6mths` | `0.0637` |
-| 8 | `all_util` | `0.0593` |
-| 9 | `term` | `0.0536` |
-| 10 | `verification_status` | `0.0509` |
-| 11 | `title_grouped` | `0.0478` |
-| 12 | `mort_acc` | `0.0362` |
-| 13 | `home_ownership` | `0.0354` |
-| 14 | `mo_sin_rcnt_tl` | `0.0347` |
-| 15 | `tot_cur_bal` | `0.0338` |
-
-This profile is healthy because the model is not relying on a single variable. It uses a broad combination of revolving capacity, requested loan size, active revolving debt, debt burden, income, recent credit activity, utilization, loan term, verification status, and borrower intent.
-
-## Model Architectures Tested
-Three modeling stages were tested:
-
-1. Logistic regression as the baseline and interpretability benchmark.
-2. Tree-based models: decision tree and random forest.
-3. Gradient-boosted trees, then tuned gradient-boosted trees.
-
-All main architecture comparisons used the same top-15 independent feature set.
-
-## Architecture 1: Logistic Regression
-Logistic regression models the log-odds of default as a linear function of the features:
-
-```text
-z_i = beta_0 + beta_1*x_i1 + ... + beta_p*x_ip
-p_i = P(y_i = 1 | x_i) = 1 / (1 + exp(-z_i))
-logit(p_i) = log(p_i / (1 - p_i)) = z_i
-```
-
-The model is trained by minimizing binary log loss, with regularization:
-
-```text
-Loss = -sum(y_i*log(p_i) + (1 - y_i)*log(1 - p_i)) + lambda * ||beta||_2^2
-```
-
-Interpretation:
-
-```text
-odds_ratio_j = exp(beta_j)
-```
-
-If `odds_ratio_j > 1`, the feature increases estimated default odds, holding other features constant. If `odds_ratio_j < 1`, it reduces estimated default odds.
-
-Logistic regression results:
-
-| Logistic feature set | Features | ROC AUC | PR AUC | Brier score | Top-decile default rate | Top-decile lift |
-|---|---:|---:|---:|---:|---:|---:|
-| `top_5_plus_pricing_benchmark` | `9` | `0.6965` | `0.3588` | `0.1469` | `43.70%` | `2.1908` |
-| `top_15` | `15` | `0.6870` | `0.3585` | `0.1477` | `44.57%` | `2.2344` |
-| `top_10` | `10` | `0.6475` | `0.3091` | `0.1528` | `37.84%` | `1.8969` |
-| `top_5` | `5` | `0.6202` | `0.2861` | `0.1551` | `34.83%` | `1.7460` |
-
-Interpretation:
-The `top_5_plus_pricing_benchmark` had the best logistic ROC AUC, but it includes Lending Club pricing/risk-grade variables. The `top_15` logistic model is the more useful independent benchmark because it avoids relying on those pricing fields while still giving strong top-decile risk concentration. Logistic regression is easy to explain and provides stable directional insight, but it is limited because it assumes mostly linear additive effects unless interactions are explicitly engineered.
-
-## Architecture 2: Decision Tree And Random Forest
-### Decision Tree Math
-A decision tree recursively splits the data into regions. At each split, it chooses the feature and threshold that best reduce impurity. For binary classification, the Gini impurity is:
-
-```text
-Gini(node) = 1 - p_default^2 - p_non_default^2
-```
-
-The split objective is impurity reduction:
-
-```text
-gain = impurity(parent)
-       - weighted_impurity(left_child)
-       - weighted_impurity(right_child)
-```
-
-Interpretation:
-A single tree is easy to explain because it follows a sequence of rules, but it can be unstable and may over-focus on a small number of dominant variables.
-
-### Random Forest Math
-A random forest averages many decision trees trained on randomized samples and feature subsets:
-
-```text
-p_forest(x) = (1 / T) * sum_t p_tree_t(x)
-```
-
-This reduces variance compared with a single tree. Random forests are usually more stable than a single decision tree, but they can still be less effective than boosted trees when the signal requires sequential correction of errors.
-
-Tree-based model results:
-
-| Model | ROC AUC | PR AUC | Brier score | Top-decile default rate | Top-decile lift | Interpretation |
-|---|---:|---:|---:|---:|---:|---|
-| `logistic_regression_top_15` | `0.6870` | `0.3585` | `0.1477` | `44.57%` | `2.2344` | Strong independent benchmark. |
-| `random_forest_top_15` | `0.6766` | `0.3523` | `0.1525` | `43.26%` | `2.1686` | Reasonable ranking, but weaker than logistic. |
-| `decision_tree_top_15` | `0.3983` | `0.1670` | `0.1530` | `38.88%` | `1.9491` | Not competitive. |
-
-Interpretation:
-The decision tree performed poorly and was dominated by a small number of splits, especially `term`. The random forest improved stability but still underperformed the top-15 logistic model. This showed that tree-based nonlinearities were potentially useful, but the plain tree and random forest were not the best way to capture them.
-
-## Architecture 3: Gradient-Boosted Trees
-Gradient-boosted trees build an additive sequence of trees. Each new tree is trained to improve the errors made by the current ensemble.
-
-The model has the form:
-
-```text
-F_M(x) = F_0(x) + eta * h_1(x) + eta * h_2(x) + ... + eta * h_M(x)
-p(x) = 1 / (1 + exp(-F_M(x)))
-```
-
-Where:
-
-| Term | Meaning |
-|---|---|
-| `F_M(x)` | Final ensemble score after `M` trees. |
-| `h_m(x)` | Tree added at boosting round `m`. |
-| `eta` | Learning rate, controlled by `stepSize`. |
-| `M` | Number of boosting rounds, controlled by `maxIter`. |
-
-For binary classification, the model is trained to reduce logistic loss:
-
-```text
-Loss = -sum(y_i*log(p_i) + (1 - y_i)*log(1 - p_i))
-```
-
-The key tuning parameters were:
-
-| Parameter | Role |
-|---|---|
-| `maxDepth` | Controls interaction depth and tree complexity. |
-| `maxIter` | Number of boosting rounds. |
-| `stepSize` | Learning rate for each added tree. |
-| `minInstancesPerNode` | Regularization through minimum leaf size. |
-| `subsamplingRate` | Row subsampling for each boosting iteration. |
-
-Untuned GBT result:
-
-| Model | ROC AUC | PR AUC | Brier score | Top-decile default rate | Top-decile lift |
+| Model | Validation ROC AUC | Validation PR AUC | Brier score | Top-decile default rate | Top-decile lift |
 |---|---:|---:|---:|---:|---:|
-| `gradient_boosted_trees_top_15` | `0.7009` | `0.3714` | `0.1460` | `45.47%` | `2.2794` |
-| `logistic_regression_top_15` | `0.6870` | `0.3585` | `0.1477` | `44.57%` | `2.2344` |
-| `random_forest_top_15` | `0.6766` | `0.3523` | `0.1525` | `43.26%` | `2.1686` |
-| `decision_tree_top_15` | `0.3983` | `0.1670` | `0.1530` | `38.88%` | `1.9491` |
+| `gradient_boosted_trees_full_temporal` | `0.6747` | `0.3928` | `0.1706` | `47.61%` | `1.9733` |
+| `logistic_regression_full_temporal` | `0.6687` | `0.3840` | `0.1729` | `46.67%` | `1.9343` |
+| `random_forest_full_temporal` | `0.6378` | `0.3612` | `0.1784` | `44.52%` | `1.8452` |
 
-Interpretation:
-The first GBT model became the best performer at that point. The gain over logistic regression was real but not enormous, which suggests the model was capturing useful nonlinear effects and interactions, but the tabular signal was still relatively hard.
+Gradient-boosted trees won the validation comparison across ROC AUC, PR AUC, Brier score, top-decile default rate, and top-decile lift. Logistic regression remains the interpretability benchmark because coefficients and odds ratios are easier to explain. Random forest was materially weaker and was not carried forward.
+
+The notebook also compares the models visually using:
+
+- ROC curves;
+- precision-recall curves;
+- cumulative lift curves;
+- cumulative gains curves;
+- calibration curves.
+
+These plots show model behavior across many possible thresholds rather than relying on a single classification cutoff.
 
 ## Gradient-Boosted Tree Tuning
-The GBT was tuned using an inner train/validation split from the training data:
+Four GBT configurations were evaluated on validation:
 
-| Split | Rows |
-|---|---:|
-| GBT tuning train | `224,012` |
-| GBT validation | `55,878` |
-
-Validation tuning results:
-
-| Profile | maxDepth | maxIter | stepSize | minInstancesPerNode | subsamplingRate | ROC AUC | PR AUC | Brier | Top-decile lift |
+| Profile | Depth | Iterations | Step size | Minimum instances per node | Subsampling | ROC AUC | PR AUC | Brier | Top-decile lift |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `deeper_subsampled` | `5` | `100` | `0.04` | `200` | `0.7` | `0.7020` | `0.3670` | `0.1450` | `2.2431` |
-| `deeper_regularized` | `5` | `80` | `0.05` | `250` | `0.8` | `0.7016` | `0.3654` | `0.1451` | `2.2449` |
-| `balanced_regularized` | `4` | `80` | `0.05` | `150` | `0.8` | `0.6995` | `0.3640` | `0.1454` | `2.2449` |
-| `wider_sampling` | `4` | `80` | `0.05` | `100` | `0.9` | `0.6992` | `0.3635` | `0.1455` | `2.2530` |
-| `balanced_more_trees` | `4` | `120` | `0.03` | `150` | `0.8` | `0.6988` | `0.3632` | `0.1455` | `2.2467` |
-| `shallow_slow_regularized` | `3` | `100` | `0.03` | `150` | `0.8` | `0.6951` | `0.3574` | `0.1464` | `2.1969` |
+| `deeper_subsampled` | `5` | `100` | `0.040` | `300` | `0.7` | `0.6785` | `0.3969` | `0.1700` | `1.9940` |
+| `deeper_slow` | `5` | `140` | `0.025` | `400` | `0.8` | `0.6769` | `0.3951` | `0.1702` | `1.9824` |
+| `balanced_regularized` | `4` | `100` | `0.040` | `300` | `0.8` | `0.6733` | `0.3903` | `0.1710` | `1.9429` |
+| `shallow_regularized` | `3` | `100` | `0.040` | `400` | `0.8` | `0.6690` | `0.3866` | `0.1717` | `1.9376` |
 
-The chosen tuning profile was `deeper_subsampled`. Although `wider_sampling` had the highest validation top-decile lift, `deeper_subsampled` was selected because it had the best broader combination of ROC AUC, PR AUC, and Brier score.
+The selected profile was:
 
-Final held-out test comparison:
+```text
+deeper_subsampled
+maxDepth = 5
+maxIter = 100
+stepSize = 0.04
+minInstancesPerNode = 300
+subsamplingRate = 0.7
+```
 
-| Model | Family | ROC AUC | PR AUC | Brier score | Top-decile default rate | Top-decile lift | Precision at 0.5 | Recall at 0.5 | F1 at 0.5 |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `tuned_gradient_boosted_trees_top_15` | Tuned GBT | `0.7032` | `0.3742` | `0.1456` | `46.34%` | `2.3230` | `0.5569` | `0.0840` | `0.1460` |
-| `gradient_boosted_trees_top_15` | GBT | `0.7009` | `0.3714` | `0.1460` | `45.47%` | `2.2794` | `0.5544` | `0.0739` | `0.1305` |
-| `logistic_regression_top_15` | Logistic regression | `0.6870` | `0.3585` | `0.1477` | `44.57%` | `2.2344` | `0.5571` | `0.0405` | `0.0755` |
-| `random_forest_top_15` | Random forest | `0.6766` | `0.3523` | `0.1525` | `43.26%` | `2.1686` | N/A | `0.0000` | N/A |
-| `decision_tree_top_15` | Decision tree | `0.3983` | `0.1670` | `0.1530` | `38.88%` | `1.9491` | `0.5239` | `0.0533` | `0.0968` |
+It produced the strongest validation ROC AUC, PR AUC, Brier score, and top-decile lift. The final model was then retrained on the combined training and validation periods before being evaluated on the untouched test period.
+
+## Final Untouched Test Result
+The selected GBT was refitted on `1,157,414` combined training and validation records. It was then evaluated once on the `148,972` newest-period test loans.
+
+| Model | Rows | Default rate | ROC AUC | PR AUC | Brier score | Top-decile default rate | Top-decile lift |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `tuned_gbt_full_temporal` | `148,972` | `20.23%` | `0.6843` | `0.3453` | `0.1511` | `41.62%` | `2.0569` |
+
+### Interpretation
+- **ROC AUC `0.6843`:** the model ranks a randomly selected default above a randomly selected non-default approximately `68.43%` of the time.
+- **PR AUC `0.3453`:** the model improves meaningfully over the test default-rate baseline of `20.23%` when identifying defaults.
+- **Brier score `0.1511`:** predicted probabilities contain useful information, but calibration can still be improved.
+- **Top-decile default rate `41.62%`:** approximately 42 of every 100 loans in the model's highest-risk decile actually defaulted.
+- **Top-decile lift `2.0569`:** the highest-risk decile was approximately 2.06 times as risky as the average test loan.
+
+## Threshold Policy Analysis
+A working probability threshold was selected using validation only. The validation threshold targeted approximately the highest-risk 10%:
+
+```text
+selected probability threshold = 0.387615
+```
+
+When this unchanged threshold was applied to the final test period:
+
+| Metric | Test result |
+|---|---:|
+| Review or rejection share | `10.72%` |
+| Approval share | `89.28%` |
+| Flagged-group default rate / precision | `41.12%` |
+| Share of all defaults captured / recall | `21.79%` |
+| Approved-group default rate | `17.72%` |
+| Correctly flagged defaults | `6,568` |
+| Flagged loans that did not default | `9,406` |
+| Approved loans that defaulted | `23,573` |
+| Approved loans that did not default | `109,425` |
+
+The threshold flags `15,974` of the `148,972` test loans. Of those flagged loans, `6,568` defaulted. This concentrates risk effectively, but it still leaves `23,573` defaults in the approved group.
+
+The threshold is therefore a useful working policy example, not a production approval rule. A final lending threshold must include:
+
+- expected loan revenue;
+- exposure at default;
+- loss given default;
+- review and rejection costs;
+- approval-volume targets;
+- risk appetite and regulatory constraints.
 
 ## Metric Definitions
-The model comparison used metrics suitable for imbalanced credit-risk classification.
 
-| Metric | Formula / definition | Interpretation |
+| Metric | Definition | Interpretation |
 |---|---|---|
-| ROC AUC | `P(score_default > score_non_default)` | Ranking quality across all classification thresholds. |
-| PR AUC | Area under precision-recall curve | More sensitive to default-class performance under class imbalance. |
-| Brier score | `mean((p_i - y_i)^2)` | Probability calibration and accuracy. Lower is better. |
-| Accuracy at 0.5 | `(TP + TN) / (TP + FP + TN + FN)` | Share of correct labels at default threshold. Can be misleading in imbalanced data. |
-| Precision at 0.5 | `TP / (TP + FP)` | Among predicted defaults, share that actually defaulted. |
-| Recall at 0.5 | `TP / (TP + FN)` | Share of actual defaults caught at threshold 0.5. |
-| F1 at 0.5 | `2 * precision * recall / (precision + recall)` | Harmonic mean of precision and recall. |
-| Top-decile default rate | Default rate in highest-scored 10% | Business ranking quality for risk review or rejection. |
-| Top-decile lift | `top_decile_default_rate / overall_default_rate` | How much risk is concentrated in the highest-risk decile. |
+| ROC AUC | `P(score_default > score_non_default)` | Overall ranking quality across thresholds |
+| PR AUC | Area under the precision-recall curve | Default-class identification under imbalance |
+| Brier score | `mean((predicted_probability - actual_outcome)^2)` | Probability accuracy and calibration; lower is better |
+| Top-decile default rate | Default rate among the highest-risk 10% | Risk concentration in the model's highest-ranked group |
+| Top-decile lift | `top_decile_default_rate / overall_default_rate` | How many times riskier the top decile is than average |
+| Precision | `TP / (TP + FP)` | Share of flagged loans that default |
+| Recall | `TP / (TP + FN)` | Share of all defaults captured by the threshold |
 
-For this project, ROC AUC, PR AUC, Brier score, and top-decile lift are more important than default `0.5` threshold accuracy. The default rate is about 20%, so a threshold of `0.5` is too conservative for many credit-risk decisions.
+## Exploratory Sample Versus Temporal Evaluation
 
-## Interpretation Across Architectures
-### Logistic Regression
-Logistic regression gave the strongest simple benchmark. It is stable, transparent, and easy to communicate. However, it is limited because feature effects are mostly additive and linear unless interactions are manually engineered.
+| Evaluation design | Tuned GBT ROC AUC | PR AUC | Brier | Top-decile lift |
+|---|---:|---:|---:|---:|
+| Earlier random-sample test | `0.7032` | `0.3742` | `0.1456` | `2.3230` |
+| Final chronological test | `0.6843` | `0.3453` | `0.1511` | `2.0569` |
 
-### Decision Tree
-The decision tree was not competitive. It over-relied on a small number of variables, especially `term`, and had poor ROC AUC and PR AUC. It is useful for interpretability but not strong enough as the final model.
-
-### Random Forest
-Random forest improved stability compared with the single decision tree, but it still underperformed logistic regression and gradient-boosted trees. It captured some nonlinear structure, but not enough to become the leading model.
-
-### Gradient-Boosted Trees
-Gradient-boosted trees provided the best performance because they can model nonlinearities and feature interactions while correcting errors sequentially. Tuning improved the model further, but the gain over the untuned GBT was modest. This means the project has moved from architecture selection into refinement.
+The temporal result is weaker but more trustworthy. Random splits mix loans from different origination periods and make training and testing populations more similar. Temporal testing asks the harder and more realistic question: can a model trained on older loans rank risk for loans originated later?
 
 ## Final Modeling Decision
-The current champion model is:
 
-```text
-tuned_gradient_boosted_trees_top_15
-```
-
-The current interpretability benchmark is:
-
-```text
-logistic_regression_top_15
-```
-
-This is the right pairing for the project:
-
-| Role | Model | Reason |
+| Role | Model | Decision |
 |---|---|---|
-| Performance champion | Tuned GBT | Best ROC AUC, PR AUC, Brier score, and top-decile lift. |
-| Interpretability benchmark | Logistic regression | Easier coefficient and odds-ratio interpretation. |
-| Not retained | Decision tree | Too weak and unstable. |
-| Not retained | Random forest | Reasonable but weaker than logistic and GBT. |
+| Performance champion | `tuned_gbt_full_temporal` | Retain as the current final candidate |
+| Interpretability benchmark | `logistic_regression_full_temporal` | Retain for coefficient and odds-ratio explanation |
+| Challenger not retained | `random_forest_full_temporal` | Weaker validation ranking and calibration |
+| Historical exploratory result | `tuned_gradient_boosted_trees_top_15` | Keep as evidence from the earlier random-sample experiment |
+
+## Limitations
+1. Only resolved loans are included. More recent origination periods may exclude unresolved loans that have not yet had enough time to default or repay, creating outcome-maturity bias.
+2. The final probabilities have not yet been formally calibrated.
+3. The working threshold does not yet include expected loss, revenue, or operational costs.
+4. Segment-level fairness and error analysis have not yet been completed.
+5. The fitted model pipeline has not yet been serialized into a production scoring artifact.
+6. No production monitoring framework currently exists for data drift, score drift, calibration drift, or realized default performance.
 
 ## Recommended Next Steps
-The next work should not be another architecture yet. Neural networks or more complex models are probably overkill at this stage because the tuned GBT is already the best practical model for this structured tabular problem.
-
-Recommended next steps:
-
-1. Calibrate `tuned_gradient_boosted_trees_top_15` probabilities.
-2. Compare calibrated versus uncalibrated Brier score and calibration curves.
-3. Build threshold tables across possible cutoffs.
-4. Add business decision columns such as approval share, rejection share, captured defaults, expected loss, and review capacity.
-5. Perform segment-level error analysis by `purpose`, `home_ownership`, `verification_status`, `term`, and other important borrower groups.
-6. Decide on a deployment threshold using business cost, not the default `0.5` cutoff.
+1. Define a fixed performance window so every loan has equal time to reach the target outcome.
+2. Calibrate the final GBT probabilities using validation-period data.
+3. Add expected-loss and profitability calculations to the threshold policy table.
+4. Evaluate performance and calibration by `home_ownership`, `verification_status`, `term`, loan purpose, and other important segments.
+5. Compare the tuned GBT and logistic benchmark for stability across origination periods.
+6. Save the final preprocessing and model pipeline as a repeatable scoring artifact.
+7. Define the application-time input contract and build a scoring service.
+8. Add production monitoring for drift, calibration, threshold outcomes, and realized losses.
 
 ## Bottom Line
-The project has progressed from exploratory statistics to a working model comparison framework. The feature analysis identified debt burden, credit activity, utilization, loan size, income, verification, housing, and borrower intent as the most useful predictive themes. Logistic regression established a strong transparent benchmark, tree-based models tested nonlinear alternatives, and tuned gradient-boosted trees became the best model so far.
+The project has progressed from exploratory analysis to a rigorous full-data temporal evaluation. The final tuned GBT demonstrates useful risk-ranking ability on future-period loans: its highest-risk decile defaults at `41.62%`, approximately `2.06` times the test-period average.
 
-The next major question is no longer "Which architecture should we try next?" It is "How should the tuned model's probabilities be calibrated and converted into a lending decision?"
+The model is a credible decision-support candidate, but it is not yet a complete automated lending policy. The next stage is to improve probability calibration, incorporate lending economics into threshold selection, verify performance across borrower segments and time periods, and package the model for repeatable scoring and monitoring.
