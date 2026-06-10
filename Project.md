@@ -35,7 +35,7 @@ Accurate default prediction helps reduce credit losses, improve pricing decision
 # Credit Risk Modeling Report
 
 ## Executive Summary
-This project now has a complete temporal credit-risk evaluation workflow. The workflow prepares more than two million historical loan records, defines a clean resolved-loan default target, selects features using training-period data only, compares multiple model families on a later validation period, tunes the leading gradient-boosted tree, and evaluates the selected model once on the newest untouched test period.
+This project now has a complete temporal credit-risk evaluation workflow. The workflow prepares more than two million historical loan records, defines a clean resolved-loan default target, selects features using training-period data only, compares multiple model families on a later validation period, tunes the leading gradient-boosted tree, and evaluates the selected model once on the newest untouched test period. It also tests probability calibration, builds cost-based threshold tables, and measures threshold behavior across important borrower segments.
 
 The authoritative result is:
 
@@ -50,6 +50,8 @@ tuned_gbt_full_temporal
 The model's highest-risk 10% had an actual default rate of `41.62%`, compared with `20.23%` across the complete test period. Therefore, the highest-risk decile was slightly more than twice as risky as the average test loan.
 
 The earlier random-sample tuned GBT achieved ROC AUC `0.7032` and top-decile lift `2.3230`. Those results remain useful as model-development evidence, but the lower temporal test result is the more credible estimate of future-period performance because the model is evaluated on loans originated after the training and validation periods.
+
+The earlier raw working cutoff is `0.387615`. A separate isotonic-calibrated, cost-based policy experiment selected cutoff `0.337390` under illustrative economics and a maximum review/rejection capacity of `20%`. This is a candidate for business discussion, not an approved deployment threshold.
 
 ## Target Definition And Eligible Population
 The original CSV contains `2,260,668` loans. Cleaning and conversion to Parquet preserve all source rows. Rows are removed from the modeling population only when defining a target that requires a known final repayment outcome.
@@ -238,8 +240,8 @@ The selected GBT was refitted on `1,157,414` combined training and validation re
 - **Top-decile default rate `41.62%`:** approximately 42 of every 100 loans in the model's highest-risk decile actually defaulted.
 - **Top-decile lift `2.0569`:** the highest-risk decile was approximately 2.06 times as risky as the average test loan.
 
-## Threshold Policy Analysis
-A working probability threshold was selected using validation only. The validation threshold targeted approximately the highest-risk 10%:
+## Raw Working Threshold
+A raw-score working threshold was selected using validation only. The validation threshold targeted approximately the highest-risk 10%:
 
 ```text
 selected probability threshold = 0.387615
@@ -261,14 +263,63 @@ When this unchanged threshold was applied to the final test period:
 
 The threshold flags `15,974` of the `148,972` test loans. Of those flagged loans, `6,568` defaulted. This concentrates risk effectively, but it still leaves `23,573` defaults in the approved group.
 
-The threshold is therefore a useful working policy example, not a production approval rule. A final lending threshold must include:
+The `0.387615` cutoff is therefore a useful ranking-policy example, not a production approval rule. It is a raw model-score cutoff and should not be interpreted as a calibrated `38.76%` probability of default.
 
-- expected loan revenue;
-- exposure at default;
-- loss given default;
-- review and rejection costs;
-- approval-volume targets;
-- risk appetite and regulatory constraints.
+## Probability Calibration
+The selected tuned GBT fitted on training data only was calibrated with isotonic regression using validation predictions. This preserves the validation period as calibration data and the later test period as an untouched calibration check.
+
+| Split | Probability type | Mean prediction | Actual default rate | Brier score | Expected calibration error |
+|---|---|---:|---:|---:|---:|
+| Validation | Raw | `22.06%` | `24.13%` | `0.169960` | `0.023781` |
+| Validation | Isotonic calibrated | `24.08%` | `24.13%` | `0.169219` | `0.001243` |
+| Test | Raw | `22.01%` | `20.23%` | `0.151896` | `0.018740` |
+| Test | Isotonic calibrated | `23.91%` | `20.23%` | `0.152606` | `0.036801` |
+
+Calibration improved validation Brier score and expected calibration error substantially. It did not generalize to the later test period: test Brier score and expected calibration error worsened because the validation-period calibrator overpredicted later test defaults. This is evidence of temporal calibration drift and means the current isotonic calibrator should not be deployed unchanged.
+
+The final train-plus-validation refit has test Brier score `0.151123`, but it cannot be honestly calibrated with the same validation rows used in its refit. A production refit requires a new calibration holdout or cross-fitted calibration.
+
+## Cost-Based Candidate Threshold
+The notebook now builds calibrated threshold tables across review/rejection shares and includes approval share, flagged and approved default rates, defaults captured, expected margin, expected default loss, review cost, expected policy value, realized policy value, and incremental expected value versus approving all loans.
+
+The initial configurable business assumptions are:
+
+- performing-loan net margin: `8%` of requested loan amount;
+- loss given default: `60%` of requested loan amount;
+- review/rejection processing cost: `$50` per flagged loan;
+- maximum review/rejection capacity: `20%` of applications;
+- flagged applications are treated as rejected.
+
+Within the capacity constraint, validation selected:
+
+```text
+calibrated cost-based candidate cutoff = 0.337390
+```
+
+| Metric | Validation selection | Untouched test application |
+|---|---:|---:|
+| Review or rejection share | `19.00%` | `19.74%` |
+| Approval share | `81.00%` | `80.26%` |
+| Flagged-group default rate | `42.70%` | `35.99%` |
+| Share of defaults captured | `33.63%` | `35.11%` |
+| Approved-group default rate | `19.77%` | `16.36%` |
+| Expected policy value | `-$93.89m` | `-$89.53m` |
+| Realized policy value | `-$102.83m` | `-$65.64m` |
+
+Under these assumptions, validation expected policy value improved by approximately `$104.82m` relative to approving every validation loan. However, every tested policy still had negative expected value, and value continued improving as rejection share approached the capacity limit. The optimizer therefore selected the operational boundary rather than an internal economic optimum. Finance and credit-risk owners must replace the illustrative assumptions before this can become a deployment threshold.
+
+## Segment-Level Error Analysis
+The calibrated candidate threshold was evaluated on test by `purpose`, `home_ownership`, `verification_status`, and `term`.
+
+Key findings:
+
+- `small_business` had the highest purpose default rate at `36.60%`; the calibrated mean prediction was `31.03%`, underestimating risk by `5.57` percentage points.
+- `60`-month loans defaulted at `28.41%`, compared with `17.38%` for `36`-month loans. The policy flagged `54.01%` of 60-month loans and captured `68.69%` of their defaults.
+- `RENT` borrowers defaulted at `25.29%`, compared with `16.39%` for `MORTGAGE`; their flagged shares were `26.21%` and `15.28%`, respectively.
+- `Verified` loans defaulted at `27.14%`, compared with `15.05%` for `Not Verified`; their flagged shares were `33.27%` and `9.66%`, respectively.
+- The largest displayed overprediction was for `60`-month loans: mean calibrated probability `36.05%` versus actual default rate `28.41%`, a `7.65` percentage-point gap.
+
+These results identify materially different policy effects across borrower groups. They are diagnostics, not a completed fairness or regulatory assessment.
 
 ## Metric Definitions
 
@@ -302,23 +353,23 @@ The temporal result is weaker but more trustworthy. Random splits mix loans from
 
 ## Limitations
 1. Only resolved loans are included. More recent origination periods may exclude unresolved loans that have not yet had enough time to default or repay, creating outcome-maturity bias.
-2. The final probabilities have not yet been formally calibrated.
-3. The working threshold does not yet include expected loss, revenue, or operational costs.
-4. Segment-level fairness and error analysis have not yet been completed.
+2. Isotonic calibration improved validation calibration but worsened out-of-time test calibration, so the calibrator is not stable enough for deployment.
+3. Cost-based threshold results depend on illustrative margin, LGD, review-cost, and capacity assumptions that have not been approved by business owners.
+4. Segment-level error analysis is complete for selected groups, but fairness, adverse-impact, legal, and regulatory review is still required.
 5. The fitted model pipeline has not yet been serialized into a production scoring artifact.
 6. No production monitoring framework currently exists for data drift, score drift, calibration drift, or realized default performance.
 
 ## Recommended Next Steps
 1. Define a fixed performance window so every loan has equal time to reach the target outcome.
-2. Calibrate the final GBT probabilities using validation-period data.
-3. Add expected-loss and profitability calculations to the threshold policy table.
-4. Evaluate performance and calibration by `home_ownership`, `verification_status`, `term`, loan purpose, and other important segments.
+2. Replace illustrative economics with approved net-margin, exposure-at-default, LGD, review-cost, rejection-cost, and capacity assumptions.
+3. Use a newer calibration holdout or cross-fitted calibration and verify that calibration improves out-of-time Brier score and expected calibration error.
+4. Complete fairness, adverse-impact, legal, and regulatory assessment across protected and operationally important segments.
 5. Compare the tuned GBT and logistic benchmark for stability across origination periods.
-6. Save the final preprocessing and model pipeline as a repeatable scoring artifact.
+6. Save the final preprocessing, ranking model, and approved calibrator as repeatable scoring artifacts.
 7. Define the application-time input contract and build a scoring service.
-8. Add production monitoring for drift, calibration, threshold outcomes, and realized losses.
+8. Add production monitoring for drift, calibration, threshold outcomes, segment outcomes, and realized losses.
 
 ## Bottom Line
 The project has progressed from exploratory analysis to a rigorous full-data temporal evaluation. The final tuned GBT demonstrates useful risk-ranking ability on future-period loans: its highest-risk decile defaults at `41.62%`, approximately `2.06` times the test-period average.
 
-The model is a credible decision-support candidate, but it is not yet a complete automated lending policy. The next stage is to improve probability calibration, incorporate lending economics into threshold selection, verify performance across borrower segments and time periods, and package the model for repeatable scoring and monitoring.
+The model is a credible decision-support candidate, but it is not yet a complete automated lending policy. The raw `0.387615` cutoff is the earlier top-risk working threshold. The calibrated `0.337390` cutoff is a cost-based candidate under illustrative assumptions, and its out-of-time calibration drift prevents it from being called a deployment threshold. The next stage is to approve the lending economics, establish stable out-of-time calibration, complete fairness review, and package the model for repeatable scoring and monitoring.
